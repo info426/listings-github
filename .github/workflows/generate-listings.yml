@@ -1,0 +1,56 @@
+name: 1 · Generate Listings
+
+on:
+  workflow_dispatch:
+    inputs:
+      brand:
+        description: "Nombre exacto del vendor en Shopify (p.ej. Virbac)"
+        required: true
+        type: string
+      skip_existing:
+        description: "Saltar productos con JSON ya generado"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  generate:
+    name: Generate SEO listings for ${{ inputs.brand }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate listings
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SHOPIFY_STORE_DOMAIN: ${{ secrets.SHOPIFY_STORE_DOMAIN }}
+          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+        run: python scripts/generate.py "${{ inputs.brand }}"
+
+      - name: Commit generated listings
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add listings/pending/
+          if git diff --staged --quiet; then
+            echo "Sin cambios nuevos que confirmar."
+          else
+            git commit -m "feat(listings): generate SEO listings for ${{ inputs.brand }}"
+            git push
+          fi
