@@ -21,11 +21,12 @@ SHOPIFY_TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
 SHOPIFY_API_VERSION = "2024-10"
 
 # GitHub Models — free for public repos, uses GITHUB_TOKEN automatically
+# Endpoint updated May 2025: https://github.blog/changelog/2025-05-15-github-models-api-now-available/
 client = OpenAI(
-    base_url="https://models.inference.ai.azure.com",
+    base_url="https://models.github.ai/inference",
     api_key=os.environ["GITHUB_TOKEN"],
 )
-MODEL = os.environ.get("MODEL", "gpt-4o")
+MODEL = os.environ.get("MODEL", "openai/gpt-4.1")
 
 TOOLS = [
     {

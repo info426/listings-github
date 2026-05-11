@@ -8,15 +8,21 @@ on:
         required: true
         type: string
       model:
-        description: "Modelo de GitHub Models a usar"
+        description: "Modelo de GitHub Models a usar (ver README para comparativa)"
         required: false
-        default: "gpt-4o"
+        default: "openai/gpt-4.1"
         type: choice
         options:
-          - gpt-4o
-          - gpt-4o-mini
-          - meta-llama-3.1-405b-instruct
-          - mistral-large
+          - openai/gpt-4.1
+          - openai/gpt-4o
+          - openai/o3
+          - openai/o3-mini
+          - deepseek/deepseek-r1
+          - deepseek/deepseek-v3
+          - xai/grok-3
+          - xai/grok-3-mini
+          - mistral-ai/mistral-medium-3
+          - meta/meta-llama-3.3-70b-instruct
 
 # Prevent parallel runs for the same brand to avoid duplicate files
 concurrency:
