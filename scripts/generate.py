@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate SEO product listings using Claude API and publish them as JSON drafts.
+Generate SEO product listings using GitHub Models (free via GITHUB_TOKEN).
 Usage: python scripts/generate.py <brand>
 """
 
@@ -12,50 +12,66 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import anthropic
 import requests
 from bs4 import BeautifulSoup
+from openai import OpenAI
 
 SHOPIFY_DOMAIN = os.environ["SHOPIFY_STORE_DOMAIN"]
 SHOPIFY_TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
 SHOPIFY_API_VERSION = "2024-10"
 
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+# GitHub Models — free for public repos, uses GITHUB_TOKEN automatically
+client = OpenAI(
+    base_url="https://models.inference.ai.azure.com",
+    api_key=os.environ["GITHUB_TOKEN"],
+)
+MODEL = os.environ.get("MODEL", "gpt-4o")
 
 TOOLS = [
     {
-        "name": "web_fetch",
-        "description": (
-            "Fetches the full text content of a URL. Use token_limit between 5000 and 10000. "
-            "If content is truncated, try a more specific URL or search query."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "Full URL to fetch"},
-                "token_limit": {
-                    "type": "integer",
-                    "description": "Approximate token limit for response (4 chars ≈ 1 token)",
-                    "default": 8000,
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": (
+                "Fetches the full text content of a URL. "
+                "Use token_limit between 5000 and 10000. "
+                "If content is truncated, try a more specific URL."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Full URL to fetch"},
+                    "token_limit": {
+                        "type": "integer",
+                        "description": "Approx token limit for response (4 chars ≈ 1 token)",
+                        "default": 8000,
+                    },
                 },
+                "required": ["url"],
             },
-            "required": ["url"],
         },
     },
     {
-        "name": "web_search",
-        "description": "Searches the web and returns a list of results with title, URL, and snippet.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "max_results": {"type": "integer", "default": 5},
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Searches the web and returns results with title, URL and snippet.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "max_results": {"type": "integer", "default": 5},
+                },
+                "required": ["query"],
             },
-            "required": ["query"],
         },
     },
 ]
 
+
+# ---------------------------------------------------------------------------
+# Web tools
+# ---------------------------------------------------------------------------
 
 def web_fetch(url: str, token_limit: int = 8000) -> str:
     headers = {
@@ -83,7 +99,6 @@ def web_fetch(url: str, token_limit: int = 8000) -> str:
 def web_search(query: str, max_results: int = 5) -> str:
     try:
         from duckduckgo_search import DDGS
-
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
         return json.dumps(results, ensure_ascii=False, indent=2)
@@ -91,13 +106,17 @@ def web_search(query: str, max_results: int = 5) -> str:
         return f"Error en búsqueda: {exc}"
 
 
-def execute_tool(name: str, tool_input: dict) -> str:
+def execute_tool(name: str, arguments: dict) -> str:
     if name == "web_fetch":
-        return web_fetch(tool_input["url"], tool_input.get("token_limit", 8000))
+        return web_fetch(arguments["url"], arguments.get("token_limit", 8000))
     if name == "web_search":
-        return web_search(tool_input["query"], tool_input.get("max_results", 5))
+        return web_search(arguments["query"], arguments.get("max_results", 5))
     return f"Herramienta desconocida: {name}"
 
+
+# ---------------------------------------------------------------------------
+# Shopify helpers
+# ---------------------------------------------------------------------------
 
 def get_shopify_products(vendor: str) -> list:
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products.json"
@@ -125,6 +144,10 @@ def get_shopify_products(vendor: str) -> list:
 
     return products
 
+
+# ---------------------------------------------------------------------------
+# Listing generation — agentic loop with GitHub Models
+# ---------------------------------------------------------------------------
 
 def build_user_message(product: dict, prompt_template: str) -> str:
     variants = [
@@ -163,47 +186,80 @@ Responde ÚNICAMENTE con un bloque JSON válido. Sin texto antes ni después. Es
 
 
 def parse_json_from_response(text: str) -> dict:
-    # Try JSON inside code fences first
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if match:
         return json.loads(match.group(1))
-    # Try bare JSON object
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         return json.loads(match.group(0))
-    raise ValueError(f"No se encontró JSON válido en la respuesta. Inicio: {text[:300]}")
+    raise ValueError(f"No se encontró JSON válido. Inicio: {text[:300]}")
+
+
+def call_with_retry(messages: list, attempt: int = 0) -> object:
+    """Call GitHub Models API with exponential backoff on rate limit errors."""
+    try:
+        return client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=8192,
+        )
+    except Exception as exc:
+        if attempt < 4 and ("rate" in str(exc).lower() or "429" in str(exc)):
+            wait = 2 ** (attempt + 1)
+            print(f"    Rate limit — esperando {wait}s...")
+            time.sleep(wait)
+            return call_with_retry(messages, attempt + 1)
+        raise
 
 
 def generate_listing(product: dict, prompt_template: str) -> dict:
-    messages = [{"role": "user", "content": build_user_message(product, prompt_template)}]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres un especialista SEO para ShopyPet (shopypet.eu). "
+                "Sigues el prompt al pie de la letra y devuelves SOLO JSON válido."
+            ),
+        },
+        {"role": "user", "content": build_user_message(product, prompt_template)},
+    ]
 
     for _ in range(25):
-        response = client.messages.create(
-            model="claude-opus-4-7",
-            max_tokens=8192,
-            tools=TOOLS,
-            messages=messages,
-        )
+        response = call_with_retry(messages)
+        choice = response.choices[0]
 
-        if response.stop_reason == "tool_use":
-            messages.append({"role": "assistant", "content": response.content})
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    result = execute_tool(block.name, block.input)
-                    tool_results.append(
-                        {"type": "tool_result", "tool_use_id": block.id, "content": result}
-                    )
-            messages.append({"role": "user", "content": tool_results})
+        if choice.finish_reason == "tool_calls":
+            # Append assistant message with tool calls
+            messages.append({"role": "assistant", "content": choice.message.content, "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in choice.message.tool_calls
+            ]})
 
-        elif response.stop_reason == "end_turn":
-            for block in response.content:
-                if hasattr(block, "text"):
-                    return parse_json_from_response(block.text)
-            break
+            # Execute each tool and append results
+            for tc in choice.message.tool_calls:
+                args = json.loads(tc.function.arguments)
+                result = execute_tool(tc.function.name, args)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
 
-    raise RuntimeError("Claude no devolvió una respuesta final después de 25 iteraciones")
+        elif choice.finish_reason == "stop":
+            return parse_json_from_response(choice.message.content)
 
+    raise RuntimeError("No se obtuvo respuesta final tras 25 iteraciones")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     brand = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("BRAND", "")).strip()
@@ -214,12 +270,13 @@ def main() -> None:
     prompt_path = Path(__file__).parent.parent / "prompts" / "seo-prompt-v12.md"
     prompt_template = prompt_path.read_text(encoding="utf-8")
 
-    print(f"Obteniendo productos de Shopify para la marca: {brand}")
+    print(f"Modelo: {MODEL}")
+    print(f"Obteniendo productos de Shopify para: {brand}")
     products = get_shopify_products(brand)
     print(f"Encontrados {len(products)} productos")
 
     if not products:
-        print("No se encontraron productos. Verifica el nombre exacto del vendor en Shopify.")
+        print("No se encontraron productos. Verifica el vendor exacto en Shopify.")
         sys.exit(0)
 
     brand_slug = brand.lower().replace(" ", "-")
@@ -247,6 +304,7 @@ def main() -> None:
                 "brand": product.get("vendor", brand),
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "prompt_version": "v12",
+                "model": MODEL,
                 "seo": {
                     "title": listing["meta_title"],
                     "description": listing["meta_description"],
@@ -257,26 +315,22 @@ def main() -> None:
             }
 
             output_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"  ✓ Guardado en {output_file.relative_to(Path(__file__).parent.parent)}")
+            print(f"  ✓ {output_file.relative_to(Path(__file__).parent.parent)}")
 
         except Exception as exc:
             msg = str(exc)
             print(f"  ✗ Error: {msg}")
             errors.append({"handle": handle, "title": product["title"], "error": msg})
-            error_file = output_dir / f"{handle}.error.json"
-            error_file.write_text(
-                json.dumps(
-                    {"shopify_product_id": product["id"], "product_title": product["title"], "error": msg},
-                    ensure_ascii=False,
-                    indent=2,
-                ),
+            (output_dir / f"{handle}.error.json").write_text(
+                json.dumps({"shopify_product_id": product["id"], "product_title": product["title"], "error": msg},
+                           ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
 
         if i < len(products):
-            time.sleep(2)
+            time.sleep(3)  # Avoid hammering GitHub Models rate limits
 
-    print(f"\nCompletado: {len(products) - len(errors)} OK, {len(errors)} errores")
+    print(f"\nCompletado: {len(products) - len(errors)} OK · {len(errors)} errores")
     if errors:
         for e in errors:
             print(f"  ✗ {e['handle']}: {e['error']}")
