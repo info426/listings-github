@@ -16,8 +16,8 @@ import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
 
-SHOPIFY_DOMAIN = os.environ["SHOPIFY_STORE_DOMAIN"]
-SHOPIFY_TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
+SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "")
+SHOPIFY_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
 SHOPIFY_API_VERSION = "2024-10"
 
 # GitHub Models — free for public repos, uses GITHUB_TOKEN automatically
@@ -259,19 +259,70 @@ def generate_listing(product: dict, prompt_template: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def slugify(text: str) -> str:
+    import unicodedata
+    text = unicodedata.normalize("NFKD", text.lower())
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return text[:80]
+
+
+def save_listing(product: dict, listing: dict, output_dir: Path, brand: str) -> Path:
+    handle = product.get("handle") or slugify(product["title"])
+    result = {
+        "shopify_product_id": product.get("id", None),
+        "shopify_handle": handle,
+        "product_title": product["title"],
+        "brand": product.get("vendor", brand),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "prompt_version": "v12",
+        "model": MODEL,
+        "seo": {
+            "title": listing["meta_title"],
+            "description": listing["meta_description"],
+            "handle": listing["slug"],
+        },
+        "body_html": listing["body_html"],
+        "missing_data": listing.get("missing_data", []),
+    }
+    output_file = output_dir / f"{handle}.json"
+    output_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return output_file
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     brand = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("BRAND", "")).strip()
+    product_title = os.environ.get("PRODUCT_TITLE", "").strip()
+
     if not brand:
-        print("Uso: python scripts/generate.py <marca>", file=sys.stderr)
+        print("Uso: python scripts/generate.py <marca> [PRODUCT_TITLE=...]", file=sys.stderr)
         sys.exit(1)
 
     prompt_path = Path(__file__).parent.parent / "prompts" / "seo-prompt-v12.md"
     prompt_template = prompt_path.read_text(encoding="utf-8")
+    brand_slug = brand.lower().replace(" ", "-")
+    output_dir = Path(__file__).parent.parent / "listings" / "pending" / brand_slug
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Modelo: {MODEL}")
+
+    # --- Manual / test mode: single product supplied directly ---
+    if product_title:
+        print(f"Modo manual — producto: {product_title}")
+        product = {"title": product_title, "vendor": brand, "product_type": "", "variants": [], "tags": ""}
+        listing = generate_listing(product, prompt_template)
+        output_file = save_listing(product, listing, output_dir, brand)
+        print(f"  ✓ {output_file.relative_to(Path(__file__).parent.parent)}")
+        return
+
+    # --- Normal mode: fetch all products for the vendor from Shopify ---
     print(f"Obteniendo productos de Shopify para: {brand}")
     products = get_shopify_products(brand)
     print(f"Encontrados {len(products)} productos")
@@ -279,10 +330,6 @@ def main() -> None:
     if not products:
         print("No se encontraron productos. Verifica el vendor exacto en Shopify.")
         sys.exit(0)
-
-    brand_slug = brand.lower().replace(" ", "-")
-    output_dir = Path(__file__).parent.parent / "listings" / "pending" / brand_slug
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     errors = []
     for i, product in enumerate(products, start=1):
@@ -297,27 +344,8 @@ def main() -> None:
 
         try:
             listing = generate_listing(product, prompt_template)
-
-            result = {
-                "shopify_product_id": product["id"],
-                "shopify_handle": handle,
-                "product_title": product["title"],
-                "brand": product.get("vendor", brand),
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-                "prompt_version": "v12",
-                "model": MODEL,
-                "seo": {
-                    "title": listing["meta_title"],
-                    "description": listing["meta_description"],
-                    "handle": listing["slug"],
-                },
-                "body_html": listing["body_html"],
-                "missing_data": listing.get("missing_data", []),
-            }
-
-            output_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"  ✓ {output_file.relative_to(Path(__file__).parent.parent)}")
-
+            out = save_listing(product, listing, output_dir, brand)
+            print(f"  ✓ {out.relative_to(Path(__file__).parent.parent)}")
         except Exception as exc:
             msg = str(exc)
             print(f"  ✗ Error: {msg}")
@@ -329,7 +357,7 @@ def main() -> None:
             )
 
         if i < len(products):
-            time.sleep(3)  # Avoid hammering GitHub Models rate limits
+            time.sleep(3)
 
     print(f"\nCompletado: {len(products) - len(errors)} OK · {len(errors)} errores")
     if errors:
